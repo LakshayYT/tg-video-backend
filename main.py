@@ -28,7 +28,7 @@ async def list_videos():
     entity = await client.get_entity(GROUP_USERNAME)
     history = await client(GetHistoryRequest(
         peer=entity,
-        limit=50,
+        limit=5000,
         offset_date=None,
         offset_id=0,
         max_id=0,
@@ -64,3 +64,4 @@ async def stream_video(msg_id: int):
             yield chunk
 
     return StreamingResponse(video_generator(), media_type="video/mp4")
+
