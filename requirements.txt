@@ -1,5 +1,5 @@
-fastapi
-uvicorn
+fastapi==0.110.0
+uvicorn==0.27.1
+telethon==1.34.0
+tgcrypto==1.2.5
 requests
-telethon
-tgcrypto
