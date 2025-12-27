@@ -1,17 +1,25 @@
 import os
-from fastapi import FastAPI, HTTPException, Response
-import requests
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse, RedirectResponse
+from pyrogram import Client
 
 app = FastAPI()
 
 # ---------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8416192372:AAEB5qfAW2ExFvZquF-uTo03-kSPBSryLtk") 
-file_path_cache = {}
+# You MUST set these in Railway Variables for the streaming to work
+# Get them from https://my.telegram.org/apps
+API_ID = int(os.getenv("API_ID", "25553656")) 
+API_HASH = os.getenv("API_HASH", "871b96c886915152865d49673a6e8e86")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8416192372:AAEB5qfAW2ExFvZquF-uTo03-kSPBSryLtk")
+
+# Initialize Pyrogram Client
+client = Client("my_bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 
 # ---------------------------------------------------------
-# EMBEDDED DATA (Single Source of Truth)
+# EMBEDDED DATA
 # ---------------------------------------------------------
 lectures_db = [
     {"id": 1, "telegram_file_id": "BAACAgUAAxkBAAEZuFVpTwpkfL2UU6FuC7i8aGMJeyV7KAAC2hwAAgKwgVWA-wAB7t22CMM2BA", "railway_url": None},
@@ -82,6 +90,14 @@ lectures_db = [
     {"id": 66, "telegram_file_id": "BAACAgUAAxkBAAEZuKVpTwtJ2Tk9xXD4UWBTR5egeb6ZnwACNR4AAnWlCFaRGLJ4mzffTjYE", "railway_url": None}
 ]
 
+@app.on_event("startup")
+async def on_startup():
+    await client.start()
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await client.stop()
+
 @app.get("/")
 def health_check():
     return {"status": "active", "lectures_count": len(lectures_db)}
@@ -91,51 +107,38 @@ def get_videos():
     return lectures_db
 
 @app.get("/stream/{lecture_id}")
-def stream_video(lecture_id: int):
+async def stream_video(lecture_id: int):
     # 1. Find lecture
     lecture = next((l for l in lectures_db if l["id"] == lecture_id), None)
     
     if not lecture:
-        print(f"Lecture {lecture_id} not found in DB")
         raise HTTPException(status_code=404, detail=f"Lecture {lecture_id} not found")
 
     # 2. Try Telegram Source
     if lecture.get("telegram_file_id"):
         file_id = lecture["telegram_file_id"]
         
-        # NOTE: CACHE REMOVED to solve expired links issue
-        
-        # B. Call Telegram API to resolve path
         try:
-            tg_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}"
-            resp = requests.get(tg_api_url, timeout=5)
-            data = resp.json()
+            # We use Pyrogram to stream the file chunks.
+            # This proxies the traffic through Railway, bypassing the 20MB Bot API limit.
             
-            if data.get("ok"):
-                file_path = data["result"]["file_path"]
-                # DO NOT cache invalid/temporary links
-                
-                # Construct final stream URL
-                final_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-                print(f"Resolved URL for {lecture_id}: {final_url}")
-                return Response(status_code=302, headers={"Location": final_url})
-            else:
-                print(f"Telegram API Error for {file_id}: {data}")
-                error_desc = data.get("description", "Unknown Telegram Error")
-                raise HTTPException(status_code=502, detail=f"Telegram Error: {error_desc}")
+            async def chunk_generator():
+                try:
+                    # chunk_size is mostly managed by Pyrogram, but we can iterate
+                    async for chunk in client.stream_media(file_id):
+                        yield chunk
+                except Exception as e:
+                    print(f"Stream interrupted: {e}")
 
-        except HTTPException:
-            raise
+            return StreamingResponse(chunk_generator(), media_type="video/mp4")
+
         except Exception as e:
-            print(f"Telegram Connection Error: {e}")
+            print(f"Streaming Setup Error: {e}")
             raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
 
     # 3. Fallback to Railway URL (if provided)
     if lecture.get("railway_url"):
-        return Response(status_code=302, headers={"Location": lecture["railway_url"]})
-
-    # Error logging
-    print(f"CRITICAL ERROR: Could not resolve ANY source for Lecture ID {lecture_id}. Telegram ID was: {lecture.get('telegram_file_id')}")
+        return RedirectResponse(lecture["railway_url"])
 
     # 4. If all fails
     raise HTTPException(status_code=404, detail="Video source unavailable")
