@@ -1,41 +1,77 @@
 import os
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import GetHistoryRequest
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-GROUP_USERNAME = os.getenv("GROUP_USERNAME")
-SESSION_STRING = os.getenv("SESSION_STRING")
+# =========================
+# Environment Variables
+# =========================
 
-app = FastAPI()
+try:
+    API_ID = int(os.environ["API_ID"])
+    API_HASH = os.environ["API_HASH"]
+    GROUP_USERNAME = os.environ["GROUP_USERNAME"]
+    SESSION_STRING = os.environ["SESSION_STRING"]
+except KeyError as e:
+    raise RuntimeError(f"Missing required env variable: {e}")
+
+# =========================
+# Telegram Client
+# =========================
 
 client = TelegramClient(
     StringSession(SESSION_STRING),
     API_ID,
-    API_HASH
+    API_HASH,
+    connection_retries=5,
+    retry_delay=2,
+    auto_reconnect=True
 )
 
-@app.on_event("startup")
-async def startup():
+# =========================
+# FastAPI Lifespan
+# =========================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     await client.start()
-    print("✅ Telegram client connected using string session")
+    print("✅ Telegram client connected")
+    yield
+    await client.disconnect()
+    print("🛑 Telegram client disconnected")
+
+app = FastAPI(lifespan=lifespan)
+
+# =========================
+# Routes
+# =========================
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "telegram-video-streamer"}
 
 @app.get("/videos")
 async def list_videos():
-    entity = await client.get_entity(GROUP_USERNAME)
-    history = await client(GetHistoryRequest(
-        peer=entity,
-        limit=5000,
-        offset_date=None,
-        offset_id=0,
-        max_id=0,
-        min_id=0,
-        add_offset=0,
-        hash=0
-    ))
+    try:
+        entity = await client.get_entity(GROUP_USERNAME)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid group/channel username")
+
+    history = await client(
+        GetHistoryRequest(
+            peer=entity,
+            limit=2000,
+            offset_date=None,
+            offset_id=0,
+            max_id=0,
+            min_id=0,
+            add_offset=0,
+            hash=0
+        )
+    )
 
     videos = []
     for msg in history.messages:
@@ -59,9 +95,11 @@ async def stream_video(msg_id: int):
     async def video_generator():
         async for chunk in client.iter_download(
             msg.video,
-            chunk_size=1024 * 1024
+            chunk_size=256 * 1024  # Railway-safe chunk size
         ):
             yield chunk
 
-    return StreamingResponse(video_generator(), media_type="video/mp4")
-
+    return StreamingResponse(
+        video_generator(),
+        media_type="video/mp4"
+    )
