@@ -1,70 +1,61 @@
 import os
-import requests
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse
+from telethon import TelegramClient
+from telethon.tl.types import MessageMediaDocument
+from telethon.tl.functions.messages import GetHistoryRequest
+import asyncio
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHANNEL_USERNAME = "project45lakshya"   # WITHOUT @
-
-if not BOT_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
-
-BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-FILE_BASE = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+GROUP_USERNAME = os.getenv("GROUP_USERNAME")
 
 app = FastAPI()
 
-# simple in-memory cache: message_id -> video_url
-CACHE = {}
+client = TelegramClient("session", API_ID, API_HASH)
 
-@app.get("/")
-def root():
-    return {"status": "ok"}
+@app.on_event("startup")
+async def startup():
+    await client.start()
 
-@app.get("/video/{message_id}")
-def get_video_by_message_id(message_id: int):
+@app.get("/videos")
+async def list_videos():
+    entity = await client.get_entity(GROUP_USERNAME)
+    history = await client(GetHistoryRequest(
+        peer=entity,
+        limit=50,
+        offset_date=None,
+        offset_id=0,
+        max_id=0,
+        min_id=0,
+        add_offset=0,
+        hash=0
+    ))
 
-    # cache hit
-    if message_id in CACHE:
-        return CACHE[message_id]
+    videos = []
+    for msg in history.messages:
+        if msg.video:
+            videos.append({
+                "id": msg.id,
+                "title": msg.message or f"Video {msg.id}",
+                "size_mb": round(msg.video.size / (1024 * 1024), 2)
+            })
 
-    # 1️⃣ get message from channel
-    r = requests.get(
-        f"{BASE_URL}/getMessage",
-        params={
-            "chat_id": f"@{CHANNEL_USERNAME}",
-            "message_id": message_id
-        },
-        timeout=10
+    return JSONResponse(videos)
+
+@app.get("/stream/{msg_id}")
+async def stream_video(msg_id: int):
+    entity = await client.get_entity(GROUP_USERNAME)
+    msg = await client.get_messages(entity, ids=msg_id)
+
+    if not msg or not msg.video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    async def video_generator():
+        async for chunk in client.iter_download(msg.video, chunk_size=1024*1024):
+            yield chunk
+
+    return StreamingResponse(
+        video_generator(),
+        media_type="video/mp4"
     )
-
-    data = r.json()
-    if not data.get("ok"):
-        raise HTTPException(status_code=404, detail="Message not found")
-
-    message = data["result"]
-
-    if "video" not in message:
-        raise HTTPException(status_code=404, detail="Message has no video")
-
-    # 2️⃣ bot-native file_id
-    file_id = message["video"]["file_id"]
-
-    # 3️⃣ get file_path
-    r2 = requests.get(
-        f"{BASE_URL}/getFile",
-        params={"file_id": file_id},
-        timeout=10
-    )
-
-    data2 = r2.json()
-    if not data2.get("ok"):
-        raise HTTPException(status_code=400, detail="getFile failed")
-
-    file_path = data2["result"]["file_path"]
-    video_url = f"{FILE_BASE}/{file_path}"
-
-    response = {"video_url": video_url}
-    CACHE[message_id] = response
-
-    return JSONResponse(response)
